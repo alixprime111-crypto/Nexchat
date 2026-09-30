@@ -1,46 +1,25 @@
-import tauriConfig from "../../src-tauri/tauri.conf.json";
-import { DEFAULT_INPUT_TEMPLATE } from "../constant";
+import fs from "fs";
+import path from "path";
+import { CN_MASKS } from "./cn";
+import { TW_MASKS } from "./tw";
+import { EN_MASKS } from "./en";
 
-export const getBuildConfig = () => {
-  if (typeof process === "undefined") {
-    throw Error(
-      "[Server Config] you are importing a nodejs-only module outside of nodejs",
-    );
-  }
+import { type BuiltinMask } from "./typing";
 
-  const buildMode = process.env.BUILD_MODE ?? "standalone";
-  const isApp = !!process.env.BUILD_APP;
-  const version = "v" + tauriConfig.package.version;
-
-  const commitInfo = (() => {
-    try {
-      const childProcess = require("child_process");
-      const commitDate: string = childProcess
-        .execSync('git log -1 --format="%at000" --date=unix')
-        .toString()
-        .trim();
-      const commitHash: string = childProcess
-        .execSync('git log --pretty=format:"%H" -n 1')
-        .toString()
-        .trim();
-
-      return { commitDate, commitHash };
-    } catch (e) {
-      console.error("[Build Config] No git or not from git repo.");
-      return {
-        commitDate: "unknown",
-        commitHash: "unknown",
-      };
-    }
-  })();
-
-  return {
-    version,
-    ...commitInfo,
-    buildMode,
-    isApp,
-    template: process.env.DEFAULT_INPUT_TEMPLATE ?? DEFAULT_INPUT_TEMPLATE,
-  };
+const BUILTIN_MASKS: Record<string, BuiltinMask[]> = {
+  cn: CN_MASKS,
+  tw: TW_MASKS,
+  en: EN_MASKS,
 };
 
-export type BuildConfig = ReturnType<typeof getBuildConfig>;
+const dirname = path.dirname(__filename);
+
+fs.writeFile(
+  dirname + "/../../public/masks.json",
+  JSON.stringify(BUILTIN_MASKS, null, 4),
+  function (error) {
+    if (error) {
+      console.error("[Build] failed to build masks", error);
+    }
+  },
+);
