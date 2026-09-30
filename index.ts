@@ -1,38 +1,33 @@
-import { Mask } from "../store/mask";
+import { createWebDavClient } from "./webdav";
+import { createUpstashClient } from "./upstash";
 
-import { type BuiltinMask } from "./typing";
-export { type BuiltinMask } from "./typing";
+export enum ProviderType {
+  WebDAV = "webdav",
+  UpStash = "upstash",
+}
 
-export const BUILTIN_MASK_ID = 100000;
+export const SyncClients = {
+  [ProviderType.UpStash]: createUpstashClient,
+  [ProviderType.WebDAV]: createWebDavClient,
+} as const;
 
-export const BUILTIN_MASK_STORE = {
-  buildinId: BUILTIN_MASK_ID,
-  masks: {} as Record<string, BuiltinMask>,
-  get(id?: string) {
-    if (!id) return undefined;
-    return this.masks[id] as Mask | undefined;
-  },
-  add(m: BuiltinMask) {
-    const mask = { ...m, id: this.buildinId++, builtin: true };
-    this.masks[mask.id] = mask;
-    return mask;
-  },
+type SyncClientConfig = {
+  [K in keyof typeof SyncClients]: (typeof SyncClients)[K] extends (
+    _: infer C,
+  ) => any
+    ? C
+    : never;
 };
 
-export const BUILTIN_MASKS: BuiltinMask[] = [];
+export type SyncClient = {
+  get: (key: string) => Promise<string>;
+  set: (key: string, value: string) => Promise<void>;
+  check: () => Promise<boolean>;
+};
 
-if (typeof window != "undefined") {
-  // run in browser skip in next server
-  fetch("/masks.json")
-    .then((res) => res.json())
-    .catch((error) => {
-      console.error("[Fetch] failed to fetch masks", error);
-      return { cn: [], tw: [], en: [] };
-    })
-    .then((masks) => {
-      const { cn = [], tw = [], en = [] } = masks;
-      return [...cn, ...tw, ...en].map((m) => {
-        BUILTIN_MASKS.push(BUILTIN_MASK_STORE.add(m));
-      });
-    });
+export function createSyncClient<T extends ProviderType>(
+  provider: T,
+  config: SyncClientConfig[T],
+): SyncClient {
+  return SyncClients[provider](config as any) as any;
 }
