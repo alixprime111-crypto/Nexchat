@@ -1,10 +1,5 @@
 "use client";
-import {
-  ApiPath,
-  IFLYTEK_BASE_URL,
-  Iflytek,
-  REQUEST_TIMEOUT_MS,
-} from "@/app/constant";
+import { ApiPath, TENCENT_BASE_URL } from "@/app/constant";
 import { useAccessStore, useAppConfig, useChatStore } from "@/app/store";
 
 import {
@@ -12,6 +7,7 @@ import {
   getHeaders,
   LLMApi,
   LLMModel,
+  MultimodalContent,
   SpeechOptions,
 } from "../api";
 import Locale from "../../locales";
@@ -21,43 +17,80 @@ import {
 } from "@fortaine/fetch-event-source";
 import { prettyObject } from "@/app/utils/format";
 import { getClientConfig } from "@/app/config/client";
-import { getMessageTextContent } from "@/app/utils";
+import {
+  getMessageTextContent,
+  isVisionModel,
+  getTimeoutMSByModel,
+} from "@/app/utils";
+import mapKeys from "lodash-es/mapKeys";
+import mapValues from "lodash-es/mapValues";
+import isArray from "lodash-es/isArray";
+import isObject from "lodash-es/isObject";
 import { fetch } from "@/app/utils/stream";
 
-import { RequestPayload } from "./openai";
+export interface OpenAIListModelResponse {
+  object: string;
+  data: Array<{
+    id: string;
+    object: string;
+    root: string;
+  }>;
+}
 
-export class SparkApi implements LLMApi {
-  private disableListModels = true;
+interface RequestPayload {
+  Messages: {
+    Role: "system" | "user" | "assistant";
+    Content: string | MultimodalContent[];
+  }[];
+  Stream?: boolean;
+  Model: string;
+  Temperature: number;
+  TopP: number;
+}
 
-  path(path: string): string {
+function capitalizeKeys(obj: any): any {
+  if (isArray(obj)) {
+    return obj.map(capitalizeKeys);
+  } else if (isObject(obj)) {
+    return mapValues(
+      mapKeys(obj, (value: any, key: string) =>
+        key.replace(/(^|_)(\w)/g, (m, $1, $2) => $2.toUpperCase()),
+      ),
+      capitalizeKeys,
+    );
+  } else {
+    return obj;
+  }
+}
+
+export class HunyuanApi implements LLMApi {
+  path(): string {
     const accessStore = useAccessStore.getState();
 
     let baseUrl = "";
 
     if (accessStore.useCustomConfig) {
-      baseUrl = accessStore.iflytekUrl;
+      baseUrl = accessStore.tencentUrl;
     }
 
     if (baseUrl.length === 0) {
       const isApp = !!getClientConfig()?.isApp;
-      const apiPath = ApiPath.Iflytek;
-      baseUrl = isApp ? IFLYTEK_BASE_URL : apiPath;
+      baseUrl = isApp ? TENCENT_BASE_URL : ApiPath.Tencent;
     }
 
     if (baseUrl.endsWith("/")) {
       baseUrl = baseUrl.slice(0, baseUrl.length - 1);
     }
-    if (!baseUrl.startsWith("http") && !baseUrl.startsWith(ApiPath.Iflytek)) {
+    if (!baseUrl.startsWith("http") && !baseUrl.startsWith(ApiPath.Tencent)) {
       baseUrl = "https://" + baseUrl;
     }
 
-    console.log("[Proxy Endpoint] ", baseUrl, path);
-
-    return [baseUrl, path].join("/");
+    console.log("[Proxy Endpoint] ", baseUrl);
+    return baseUrl;
   }
 
   extractMessage(res: any) {
-    return res.choices?.at(0)?.message?.content ?? "";
+    return res.Choices?.at(0)?.Message?.Content ?? "";
   }
 
   speech(options: SpeechOptions): Promise<ArrayBuffer> {
@@ -65,41 +98,37 @@ export class SparkApi implements LLMApi {
   }
 
   async chat(options: ChatOptions) {
-    const messages: ChatOptions["messages"] = [];
-    for (const v of options.messages) {
-      const content = getMessageTextContent(v);
-      messages.push({ role: v.role, content });
-    }
+    const visionModel = isVisionModel(options.config.model);
+    const messages = options.messages.map((v, index) => ({
+      // "Messages 中 system 角色必须位于列表的最开始"
+      role: index !== 0 && v.role === "system" ? "user" : v.role,
+      content: visionModel ? v.content : getMessageTextContent(v),
+    }));
 
     const modelConfig = {
       ...useAppConfig.getState().modelConfig,
       ...useChatStore.getState().currentSession().mask.modelConfig,
       ...{
         model: options.config.model,
-        providerName: options.config.providerName,
       },
     };
 
-    const requestPayload: RequestPayload = {
-      messages,
-      stream: options.config.stream,
+    const requestPayload: RequestPayload = capitalizeKeys({
       model: modelConfig.model,
+      messages,
       temperature: modelConfig.temperature,
-      presence_penalty: modelConfig.presence_penalty,
-      frequency_penalty: modelConfig.frequency_penalty,
       top_p: modelConfig.top_p,
-      // max_tokens: Math.max(modelConfig.max_tokens, 1024),
-      // Please do not ask me why not send max_tokens, no reason, this param is just shit, I dont want to explain anymore.
-    };
+      stream: options.config.stream,
+    });
 
-    console.log("[Request] Spark payload: ", requestPayload);
+    console.log("[Request] Tencent payload: ", requestPayload);
 
     const shouldStream = !!options.config.stream;
     const controller = new AbortController();
     options.onController?.(controller);
 
     try {
-      const chatPath = this.path(Iflytek.ChatPath);
+      const chatPath = this.path();
       const chatPayload = {
         method: "POST",
         body: JSON.stringify(requestPayload),
@@ -107,10 +136,10 @@ export class SparkApi implements LLMApi {
         headers: getHeaders(),
       };
 
-      // Make a fetch request
+      // make a fetch request
       const requestTimeoutId = setTimeout(
         () => controller.abort(),
-        REQUEST_TIMEOUT_MS,
+        getTimeoutMSByModel(options.config.model),
       );
 
       if (shouldStream) {
@@ -119,11 +148,14 @@ export class SparkApi implements LLMApi {
         let finished = false;
         let responseRes: Response;
 
-        // Animate response text to make it look smooth
+        // animate response to make it looks smooth
         function animateResponseText() {
           if (finished || controller.signal.aborted) {
             responseText += remainText;
             console.log("[Response Animation] finished");
+            if (responseText?.length === 0) {
+              options.onError?.(new Error("empty response from server"));
+            }
             return;
           }
 
@@ -138,7 +170,7 @@ export class SparkApi implements LLMApi {
           requestAnimationFrame(animateResponseText);
         }
 
-        // Start animation
+        // start animaion
         animateResponseText();
 
         const finish = () => {
@@ -156,14 +188,16 @@ export class SparkApi implements LLMApi {
           async onopen(res) {
             clearTimeout(requestTimeoutId);
             const contentType = res.headers.get("content-type");
-            console.log("[Spark] request response content type: ", contentType);
+            console.log(
+              "[Tencent] request response content type: ",
+              contentType,
+            );
             responseRes = res;
             if (contentType?.startsWith("text/plain")) {
               responseText = await res.clone().text();
               return finish();
             }
 
-            // Handle different error scenarios
             if (
               !res.ok ||
               !res.headers
@@ -171,6 +205,7 @@ export class SparkApi implements LLMApi {
                 ?.startsWith(EventStreamContentType) ||
               res.status !== 200
             ) {
+              const responseTexts = [responseText];
               let extraInfo = await res.clone().text();
               try {
                 const resJson = await res.clone().json();
@@ -178,14 +213,15 @@ export class SparkApi implements LLMApi {
               } catch {}
 
               if (res.status === 401) {
-                extraInfo = Locale.Error.Unauthorized;
+                responseTexts.push(Locale.Error.Unauthorized);
               }
 
-              options.onError?.(
-                new Error(
-                  `Request failed with status ${res.status}: ${extraInfo}`,
-                ),
-              );
+              if (extraInfo) {
+                responseTexts.push(extraInfo);
+              }
+
+              responseText = responseTexts.join("\n\n");
+
               return finish();
             }
           },
@@ -196,17 +232,15 @@ export class SparkApi implements LLMApi {
             const text = msg.data;
             try {
               const json = JSON.parse(text);
-              const choices = json.choices as Array<{
-                delta: { content: string };
+              const choices = json.Choices as Array<{
+                Delta: { Content: string };
               }>;
-              const delta = choices[0]?.delta?.content;
-
+              const delta = choices[0]?.Delta?.Content;
               if (delta) {
                 remainText += delta;
               }
             } catch (e) {
-              console.error("[Request] parse error", text);
-              options.onError?.(new Error(`Failed to parse response: ${text}`));
+              console.error("[Request] parse error", text, msg);
             }
           },
           onclose() {
@@ -222,14 +256,6 @@ export class SparkApi implements LLMApi {
         const res = await fetch(chatPath, chatPayload);
         clearTimeout(requestTimeoutId);
 
-        if (!res.ok) {
-          const errorText = await res.text();
-          options.onError?.(
-            new Error(`Request failed with status ${res.status}: ${errorText}`),
-          );
-          return;
-        }
-
         const resJson = await res.json();
         const message = this.extractMessage(resJson);
         options.onFinish(message, res);
@@ -239,7 +265,6 @@ export class SparkApi implements LLMApi {
       options.onError?.(e as Error);
     }
   }
-
   async usage() {
     return {
       used: 0,

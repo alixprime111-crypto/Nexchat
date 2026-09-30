@@ -1,128 +1,287 @@
-import { getServerSideConfig } from "@/app/config/server";
+"use client";
+// azure and openai, using same models. so using same LLMApi.
 import {
-  SILICONFLOW_BASE_URL,
   ApiPath,
-  ModelProvider,
-  ServiceProvider,
+  SILICONFLOW_BASE_URL,
+  SiliconFlow,
+  DEFAULT_MODELS,
 } from "@/app/constant";
-import { prettyObject } from "@/app/utils/format";
-import { NextRequest, NextResponse } from "next/server";
-import { auth } from "@/app/api/auth";
-import { isModelNotavailableInServer } from "@/app/utils/model";
+import {
+  useAccessStore,
+  useAppConfig,
+  useChatStore,
+  ChatMessageTool,
+  usePluginStore,
+} from "@/app/store";
+import { preProcessImageContent, streamWithThink } from "@/app/utils/chat";
+import {
+  ChatOptions,
+  getHeaders,
+  LLMApi,
+  LLMModel,
+  SpeechOptions,
+} from "../api";
+import { getClientConfig } from "@/app/config/client";
+import {
+  getMessageTextContent,
+  getMessageTextContentWithoutThinking,
+  isVisionModel,
+  getTimeoutMSByModel,
+} from "@/app/utils";
+import { RequestPayload } from "./openai";
 
-const serverConfig = getServerSideConfig();
-
-export async function handle(
-  req: NextRequest,
-  { params }: { params: { path: string[] } },
-) {
-  console.log("[SiliconFlow Route] params ", params);
-
-  if (req.method === "OPTIONS") {
-    return NextResponse.json({ body: "OK" }, { status: 200 });
-  }
-
-  const authResult = auth(req, ModelProvider.SiliconFlow);
-  if (authResult.error) {
-    return NextResponse.json(authResult, {
-      status: 401,
-    });
-  }
-
-  try {
-    const response = await request(req);
-    return response;
-  } catch (e) {
-    console.error("[SiliconFlow] ", e);
-    return NextResponse.json(prettyObject(e));
-  }
+import { fetch } from "@/app/utils/stream";
+export interface SiliconFlowListModelResponse {
+  object: string;
+  data: Array<{
+    id: string;
+    object: string;
+    root: string;
+  }>;
 }
 
-async function request(req: NextRequest) {
-  const controller = new AbortController();
+export class SiliconflowApi implements LLMApi {
+  private disableListModels = false;
 
-  // alibaba use base url or just remove the path
-  let path = `${req.nextUrl.pathname}`.replaceAll(ApiPath.SiliconFlow, "");
+  path(path: string): string {
+    const accessStore = useAccessStore.getState();
 
-  let baseUrl = serverConfig.siliconFlowUrl || SILICONFLOW_BASE_URL;
+    let baseUrl = "";
 
-  if (!baseUrl.startsWith("http")) {
-    baseUrl = `https://${baseUrl}`;
+    if (accessStore.useCustomConfig) {
+      baseUrl = accessStore.siliconflowUrl;
+    }
+
+    if (baseUrl.length === 0) {
+      const isApp = !!getClientConfig()?.isApp;
+      const apiPath = ApiPath.SiliconFlow;
+      baseUrl = isApp ? SILICONFLOW_BASE_URL : apiPath;
+    }
+
+    if (baseUrl.endsWith("/")) {
+      baseUrl = baseUrl.slice(0, baseUrl.length - 1);
+    }
+    if (
+      !baseUrl.startsWith("http") &&
+      !baseUrl.startsWith(ApiPath.SiliconFlow)
+    ) {
+      baseUrl = "https://" + baseUrl;
+    }
+
+    console.log("[Proxy Endpoint] ", baseUrl, path);
+
+    return [baseUrl, path].join("/");
   }
 
-  if (baseUrl.endsWith("/")) {
-    baseUrl = baseUrl.slice(0, -1);
+  extractMessage(res: any) {
+    return res.choices?.at(0)?.message?.content ?? "";
   }
 
-  console.log("[Proxy] ", path);
-  console.log("[Base Url]", baseUrl);
+  speech(options: SpeechOptions): Promise<ArrayBuffer> {
+    throw new Error("Method not implemented.");
+  }
 
-  const timeoutId = setTimeout(
-    () => {
-      controller.abort();
-    },
-    10 * 60 * 1000,
-  );
+  async chat(options: ChatOptions) {
+    const visionModel = isVisionModel(options.config.model);
+    const messages: ChatOptions["messages"] = [];
+    for (const v of options.messages) {
+      if (v.role === "assistant") {
+        const content = getMessageTextContentWithoutThinking(v);
+        messages.push({ role: v.role, content });
+      } else {
+        const content = visionModel
+          ? await preProcessImageContent(v.content)
+          : getMessageTextContent(v);
+        messages.push({ role: v.role, content });
+      }
+    }
 
-  const fetchUrl = `${baseUrl}${path}`;
-  const fetchOptions: RequestInit = {
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: req.headers.get("Authorization") ?? "",
-    },
-    method: req.method,
-    body: req.body,
-    redirect: "manual",
-    // @ts-ignore
-    duplex: "half",
-    signal: controller.signal,
-  };
+    const modelConfig = {
+      ...useAppConfig.getState().modelConfig,
+      ...useChatStore.getState().currentSession().mask.modelConfig,
+      ...{
+        model: options.config.model,
+        providerName: options.config.providerName,
+      },
+    };
 
-  // #1815 try to refuse some request to some models
-  if (serverConfig.customModels && req.body) {
+    const requestPayload: RequestPayload = {
+      messages,
+      stream: options.config.stream,
+      model: modelConfig.model,
+      temperature: modelConfig.temperature,
+      presence_penalty: modelConfig.presence_penalty,
+      frequency_penalty: modelConfig.frequency_penalty,
+      top_p: modelConfig.top_p,
+      // max_tokens: Math.max(modelConfig.max_tokens, 1024),
+      // Please do not ask me why not send max_tokens, no reason, this param is just shit, I dont want to explain anymore.
+    };
+
+    console.log("[Request] openai payload: ", requestPayload);
+
+    const shouldStream = !!options.config.stream;
+    const controller = new AbortController();
+    options.onController?.(controller);
+
     try {
-      const clonedBody = await req.text();
-      fetchOptions.body = clonedBody;
+      const chatPath = this.path(SiliconFlow.ChatPath);
+      const chatPayload = {
+        method: "POST",
+        body: JSON.stringify(requestPayload),
+        signal: controller.signal,
+        headers: getHeaders(),
+      };
 
-      const jsonBody = JSON.parse(clonedBody) as { model?: string };
+      // console.log(chatPayload);
 
-      // not undefined and is false
-      if (
-        isModelNotavailableInServer(
-          serverConfig.customModels,
-          jsonBody?.model as string,
-          ServiceProvider.SiliconFlow as string,
-        )
-      ) {
-        return NextResponse.json(
-          {
-            error: true,
-            message: `you are not allowed to use ${jsonBody?.model} model`,
+      // Use extended timeout for thinking models as they typically require more processing time
+      const requestTimeoutId = setTimeout(
+        () => controller.abort(),
+        getTimeoutMSByModel(options.config.model),
+      );
+
+      if (shouldStream) {
+        const [tools, funcs] = usePluginStore
+          .getState()
+          .getAsTools(
+            useChatStore.getState().currentSession().mask?.plugin || [],
+          );
+        return streamWithThink(
+          chatPath,
+          requestPayload,
+          getHeaders(),
+          tools as any,
+          funcs,
+          controller,
+          // parseSSE
+          (text: string, runTools: ChatMessageTool[]) => {
+            // console.log("parseSSE", text, runTools);
+            const json = JSON.parse(text);
+            const choices = json.choices as Array<{
+              delta: {
+                content: string | null;
+                tool_calls: ChatMessageTool[];
+                reasoning_content: string | null;
+              };
+            }>;
+            const tool_calls = choices[0]?.delta?.tool_calls;
+            if (tool_calls?.length > 0) {
+              const index = tool_calls[0]?.index;
+              const id = tool_calls[0]?.id;
+              const args = tool_calls[0]?.function?.arguments;
+              if (id) {
+                runTools.push({
+                  id,
+                  type: tool_calls[0]?.type,
+                  function: {
+                    name: tool_calls[0]?.function?.name as string,
+                    arguments: args,
+                  },
+                });
+              } else {
+                // @ts-ignore
+                runTools[index]["function"]["arguments"] += args;
+              }
+            }
+            const reasoning = choices[0]?.delta?.reasoning_content;
+            const content = choices[0]?.delta?.content;
+
+            // Skip if both content and reasoning_content are empty or null
+            if (
+              (!reasoning || reasoning.length === 0) &&
+              (!content || content.length === 0)
+            ) {
+              return {
+                isThinking: false,
+                content: "",
+              };
+            }
+
+            if (reasoning && reasoning.length > 0) {
+              return {
+                isThinking: true,
+                content: reasoning,
+              };
+            } else if (content && content.length > 0) {
+              return {
+                isThinking: false,
+                content: content,
+              };
+            }
+
+            return {
+              isThinking: false,
+              content: "",
+            };
           },
-          {
-            status: 403,
+          // processToolMessage, include tool_calls message and tool call results
+          (
+            requestPayload: RequestPayload,
+            toolCallMessage: any,
+            toolCallResult: any[],
+          ) => {
+            // @ts-ignore
+            requestPayload?.messages?.splice(
+              // @ts-ignore
+              requestPayload?.messages?.length,
+              0,
+              toolCallMessage,
+              ...toolCallResult,
+            );
           },
+          options,
         );
+      } else {
+        const res = await fetch(chatPath, chatPayload);
+        clearTimeout(requestTimeoutId);
+
+        const resJson = await res.json();
+        const message = this.extractMessage(resJson);
+        options.onFinish(message, res);
       }
     } catch (e) {
-      console.error(`[SiliconFlow] filter`, e);
+      console.log("[Request] failed to make a chat request", e);
+      options.onError?.(e as Error);
     }
   }
-  try {
-    const res = await fetch(fetchUrl, fetchOptions);
+  async usage() {
+    return {
+      used: 0,
+      total: 0,
+    };
+  }
 
-    // to prevent browser prompt for credentials
-    const newHeaders = new Headers(res.headers);
-    newHeaders.delete("www-authenticate");
-    // to disable nginx buffering
-    newHeaders.set("X-Accel-Buffering", "no");
+  async models(): Promise<LLMModel[]> {
+    if (this.disableListModels) {
+      return DEFAULT_MODELS.slice();
+    }
 
-    return new Response(res.body, {
-      status: res.status,
-      statusText: res.statusText,
-      headers: newHeaders,
+    const res = await fetch(this.path(SiliconFlow.ListModelPath), {
+      method: "GET",
+      headers: {
+        ...getHeaders(),
+      },
     });
-  } finally {
-    clearTimeout(timeoutId);
+
+    const resJson = (await res.json()) as SiliconFlowListModelResponse;
+    const chatModels = resJson.data;
+    console.log("[Models]", chatModels);
+
+    if (!chatModels) {
+      return [];
+    }
+
+    let seq = 1000; //同 Constant.ts 中的排序保持一致
+    return chatModels.map((m) => ({
+      name: m.id,
+      available: true,
+      sorted: seq++,
+      provider: {
+        id: "siliconflow",
+        providerName: "SiliconFlow",
+        providerType: "siliconflow",
+        sorted: 14,
+      },
+    }));
   }
 }
